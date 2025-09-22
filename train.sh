@@ -8,7 +8,7 @@ MUJOCO_GL=egl python main.py \
   --sparse=True \
   --horizon_length=10 \
   --eval_interval 0 \
-  --custom_dataset_path ../data_preprocessing/final_robotics_dataset.h5 \
+  --custom_dataset_path ./final_robotics_dataset.h5 \
   --save_interval 10000 \
   --online_steps 100000 \
   --offline_steps 100000 \

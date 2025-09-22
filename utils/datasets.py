@@ -4,12 +4,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.core.frozen_dict import FrozenDict
-
+import jax.tree_util # <<< CHANGED: jax.tree_util 임포트 추가
 
 def get_size(data):
     """Return the size of the dataset."""
-    sizes = jax.tree_util.tree_map(lambda arr: len(arr), data)
-    return max(jax.tree_util.tree_leaves(sizes))
+    # sizes = jax.tree_util.tree_map(lambda arr: len(arr), data)
+    # return max(jax.tree_util.tree_leaves(sizes))
+    # MODIFIED: data가 딕셔너리일 때도 올바르게 동작하도록 수정
+    if isinstance(data, dict):
+        sizes = jax.tree_util.tree_map(lambda arr: len(arr), data)
+        return max(jax.tree_util.tree_leaves(sizes))
+    return len(data)
 
 
 @partial(jax.jit, static_argnames=('padding',))
@@ -45,7 +50,12 @@ class Dataset(FrozenDict):
         data = fields
         assert 'observations' in data
         if freeze:
-            jax.tree_util.tree_map(lambda arr: arr.setflags(write=False), data)
+            def _freeze(arr):
+                if hasattr(arr, 'setflags'):
+                    arr.setflags(write=False)
+                return arr
+            jax.tree_util.tree_map(_freeze, data)
+            # jax.tree_util.tree_map(lambda arr: arr.setflags(write=False), data)
         return cls(data)
 
     def __init__(self, *args, **kwargs):
@@ -90,33 +100,50 @@ class Dataset(FrozenDict):
         return batch
 
     def sample_sequence(self, batch_size, sequence_length, discount):
+        """
+        MODIFIED: This function now correctly handles nested dictionaries for
+        observations using jax.tree_util.tree_map.
+        """
         idxs = np.random.randint(self.size - sequence_length + 1, size=batch_size)
-        
-        data = {k: v[idxs] for k, v in self.items()}
+
+        # Helper function to index arrays or map indexing over dictionaries
+        def get_batch(data, indices):
+            return jax.tree_util.tree_map(lambda arr: arr[indices], data)
+
+        batch = get_batch(self._dict, idxs)
 
         # Pre-compute all required indices
-        all_idxs = idxs[:, None] + np.arange(sequence_length)[None, :]  # (batch_size, sequence_length)
+        all_idxs = idxs[:, None] + np.arange(sequence_length)[None, :]
         all_idxs = all_idxs.flatten()
+
+        full_sequence_batch = get_batch(self._dict, all_idxs)
+
+        # Reshape each leaf in the observations pytree
+        batch_observations = jax.tree_util.tree_map(
+            lambda arr: arr.reshape(batch_size, sequence_length, *arr.shape[1:]),
+            full_sequence_batch['observations']
+        )
+        batch_next_observations = jax.tree_util.tree_map(
+            lambda arr: arr.reshape(batch_size, sequence_length, *arr.shape[1:]),
+            full_sequence_batch['next_observations']
+        )
         
-        # Batch fetch data to avoid loops
-        batch_observations = self['observations'][all_idxs].reshape(batch_size, sequence_length, *self['observations'].shape[1:])
-        batch_next_observations = self['next_observations'][all_idxs].reshape(batch_size, sequence_length, *self['next_observations'].shape[1:])
-        batch_actions = self['actions'][all_idxs].reshape(batch_size, sequence_length, *self['actions'].shape[1:])
-        batch_rewards = self['rewards'][all_idxs].reshape(batch_size, sequence_length, *self['rewards'].shape[1:])
-        batch_masks = self['masks'][all_idxs].reshape(batch_size, sequence_length, *self['masks'].shape[1:])
-        batch_terminals = self['terminals'][all_idxs].reshape(batch_size, sequence_length, *self['terminals'].shape[1:])
-        
+        # Actions and other arrays are not nested
+        batch_actions = full_sequence_batch['actions'].reshape(batch_size, sequence_length, *self['actions'].shape[1:])
+        batch_rewards = full_sequence_batch['rewards'].reshape(batch_size, sequence_length, *self['rewards'].shape[1:])
+        batch_masks = full_sequence_batch['masks'].reshape(batch_size, sequence_length, *self['masks'].shape[1:])
+        batch_terminals = full_sequence_batch['terminals'].reshape(batch_size, sequence_length, *self['terminals'].shape[1:])
+
         # Calculate next_actions
         next_action_idxs = np.minimum(all_idxs + 1, self.size - 1)
         batch_next_actions = self['actions'][next_action_idxs].reshape(batch_size, sequence_length, *self['actions'].shape[1:])
-        
-        # Use vectorized operations to calculate cumulative rewards and masks
+
+        # (Reward/mask calculation logic remains the same)
         rewards = np.zeros((batch_size, sequence_length), dtype=float)
         masks = np.ones((batch_size, sequence_length), dtype=float)
         terminals = np.zeros((batch_size, sequence_length), dtype=float)
         valid = np.ones((batch_size, sequence_length), dtype=float)
         
-        # Vectorized calculation
         rewards[:, 0] = batch_rewards[:, 0].squeeze()
         masks[:, 0] = batch_masks[:, 0].squeeze()
         terminals[:, 0] = batch_terminals[:, 0].squeeze()
@@ -128,31 +155,18 @@ class Dataset(FrozenDict):
             terminals[:, i] = np.maximum(terminals[:, i-1], batch_terminals[:, i].squeeze())
             valid[:, i] = 1.0 - terminals[:, i-1]
         
-        # Reorganize observations data format - maintain the exact same shape as the original function
-        if len(batch_observations.shape) == 5:  # Visual data: (batch, seq, h, w, c)
-            # Transpose to (batch, h, w, seq, c) format, consistent with the original function
-            observations = batch_observations.transpose(0, 2, 3, 1, 4)  # (batch_size, h, w, sequence_length, c)
-            next_observations = batch_next_observations.transpose(0, 2, 3, 1, 4)  # (batch_size, h, w, sequence_length, c)
-        else:  # State data: maintain (batch, seq, state_dim) shape
-            observations = batch_observations  # (batch_size, sequence_length, state_dim)
-            next_observations = batch_next_observations  # (batch_size, sequence_length, state_dim)
-        
-        # Maintain the 3D shape of actions and next_actions, consistent with the original function
-        actions = batch_actions  # (batch_size, sequence_length, action_dim)
-        next_actions = batch_next_actions  # (batch_size, sequence_length, action_dim)
-        
         return dict(
-            observations=data['observations'].copy(),
-            full_observations=observations,
-            actions=actions,
+            observations=batch['observations'],
+            full_observations=batch_observations,
+            actions=batch_actions,
             masks=masks,
             rewards=rewards,
             terminals=terminals,
             valid=valid,
-            next_observations=next_observations,
-            next_actions=next_actions,
+            next_observations=batch_next_observations,
+            next_actions=batch_next_actions,
         )
-
+        
     def get_subset(self, idxs):
         """Return a subset of the dataset given the indices."""
         result = jax.tree_util.tree_map(lambda arr: arr[idxs], self._dict)

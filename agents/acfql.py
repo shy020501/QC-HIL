@@ -296,25 +296,11 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
-            all_obs_keys = ex_observations.keys()
-            image_keys = sorted([k for k in all_obs_keys if k.startswith('image')])
-            state_key = 'state' # state 키는 'state'로 가정
-
-             # 설정에 맞는 인코더 클래스를 가져옵니다.
             encoder_module = encoder_modules[config['encoder']]
-            
-            # 인코더를 생성할 때, 미리 파악한 키 정보를 전달합니다.
-            encoders['critic'] = encoder_module(
-                image_keys=image_keys, state_key=state_key
-            )
-            encoders['actor_bc_flow'] = encoder_module(
-                image_keys=image_keys, state_key=state_key
-            )
-            encoders['actor_onestep_flow'] = encoder_module(
-                image_keys=image_keys, state_key=state_key
-            )
-            # --- 수정된 부분 끝 ---
-            
+            encoders['critic'] = encoder_module()
+            encoders['actor_bc_flow'] = encoder_module()
+            encoders['actor_onestep_flow'] = encoder_module()
+
         # Define networks.
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],

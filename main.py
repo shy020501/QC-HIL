@@ -14,6 +14,8 @@ from evaluation import evaluate
 from agents import agents
 import numpy as np
 
+import h5py
+
 if 'CUDA_VISIBLE_DEVICES' in os.environ:
     os.environ['EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
     os.environ['MUJOCO_EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
@@ -27,10 +29,10 @@ flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of online steps.')
 flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
-flags.DEFINE_integer('buffer_size', 2000000, 'Replay buffer size.')
+flags.DEFINE_integer('buffer_size', 200000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
-flags.DEFINE_integer('save_interval', -1, 'Save interval.')
+flags.DEFINE_integer('save_interval', 1000000, 'Save interval.')
 flags.DEFINE_integer('start_training', 5000, 'when does training start')
 
 flags.DEFINE_integer('utd_ratio', 1, "update to data ratio")
@@ -47,7 +49,11 @@ flags.DEFINE_float('dataset_proportion', 1.0, "Proportion of the dataset to use"
 flags.DEFINE_integer('dataset_replace_interval', 1000, 'Dataset replace interval, used for large datasets because of memory constraints')
 flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 
-flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
+
+flags.DEFINE_string('custom_dataset_path', None, 'Path to a custom HDF5 dataset file.')
+
+
+flags.DEFINE_integer('horizon_length', 10, 'action chunking length.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
 flags.DEFINE_bool('save_all_online_states', False, "save all trajectories to npy")
@@ -77,8 +83,49 @@ def main(_):
 
     config = FLAGS.agent
     
+    # =================================================================================
+    # Data Loading Section (CHANGED)
+    # =================================================================================
+    if FLAGS.custom_dataset_path is not None:
+        print(f"Loading custom dataset from: {FLAGS.custom_dataset_path}")
+        
+        # 1. HDF5 파일에서 데이터 로드
+        with h5py.File(FLAGS.custom_dataset_path, 'r') as f:
+            train_dataset = {
+                'observations': {
+                    'image_head': f['observations/image_head'][()],
+                    'image_wrist_left': f['observations/image_wrist_left'][()],
+                    'image_wrist_right': f['observations/image_wrist_right'][()],
+                    'state': f['observations/state'][()],
+                },
+                'actions': f['actions'][()],
+                'rewards': f['rewards'][()],
+                'terminals': f['terminals'][()],
+                'next_observations': {
+                    'image_head': f['next_observations/image_head'][()],
+                    'image_wrist_left': f['next_observations/image_wrist_left'][()],
+                    'image_wrist_right': f['next_observations/image_wrist_right'][()],
+                    'state': f['next_observations/state'][()],
+                },
+            }
+        
+        # D4RL 데이터셋 형식에 맞게 'timeouts'와 'masks' 추가
+        train_dataset['timeouts'] = train_dataset['terminals']
+        train_dataset['masks'] = 1.0 - train_dataset['terminals']
+
+        # 2. 평가(Evaluation)를 위한 환경 생성
+        # <<< CHANGED: 평가 간격(eval_interval)에 따라 환경 생성을 건너뛰도록 수정
+        if FLAGS.eval_interval > 0:
+            # 평가를 진행할 경우에만 환경을 생성
+            print(f"Creating evaluation environment for: {FLAGS.env_name}")
+            env, eval_env, _, val_dataset = make_env_and_datasets(FLAGS.env_name)
+        else:
+            # 평가를 안 할 경우, 환경 변수들을 None으로 설정
+            print("Evaluation is disabled (eval_interval=0). Skipping environment creation.")
+            env, eval_env, val_dataset = None, None, None
+            
     # data loading
-    if FLAGS.ogbench_dataset_dir is not None:
+    elif FLAGS.ogbench_dataset_dir is not None:
         # custom ogbench dataset
         assert FLAGS.dataset_replace_interval != 0
         assert FLAGS.dataset_proportion == 1.0

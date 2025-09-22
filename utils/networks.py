@@ -202,11 +202,14 @@ class Value(nn.Module):
             actions: Actions (optional).
         """
         if self.encoder is not None:
-            inputs = [self.encoder(observations)]
+            features = self.encoder(observations)
+            inputs = [features]
         else:
             inputs = [observations]
+
         if actions is not None:
             inputs.append(actions)
+            
         inputs = jnp.concatenate(inputs, axis=-1)
 
         v = self.value_net(inputs).squeeze(-1)

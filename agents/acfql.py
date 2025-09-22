@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-
+import jax.tree_util
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, Value
@@ -27,11 +27,29 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         else:
             batch_actions = batch["actions"][..., 0, :] # take the first action
         
+        # # TD loss
+        # rng, sample_rng = jax.random.split(rng)
+        # next_actions = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
+
+        # next_qs = self.network.select(f'target_critic')(batch['next_observations'][..., -1, :], actions=next_actions)
+        # ==================== MODIFIED SECTION START ====================
+        # The original code failed because batch['next_observations'] is a dict.
+        # We now use tree_map to apply the slicing to each array within the dict.
+        
+        # Helper lambda function to get the last element in a sequence
+        get_last_in_seq = lambda arr: arr[:, -1]
+        
+        # Apply this function to the entire next_observations dictionary
+        last_next_obs = jax.tree_util.tree_map(get_last_in_seq, batch['next_observations'])
+        
         # TD loss
         rng, sample_rng = jax.random.split(rng)
-        next_actions = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
+        # Use the processed last_next_obs dictionary
+        next_actions = self.sample_actions(last_next_obs, rng=sample_rng)
 
-        next_qs = self.network.select(f'target_critic')(batch['next_observations'][..., -1, :], actions=next_actions)
+        next_qs = self.network.select(f'target_critic')(last_next_obs, actions=next_actions)
+        # ===================== MODIFIED SECTION END =====================
+        
         if self.config['q_agg'] == 'min':
             next_q = next_qs.min(axis=0)
         else:
@@ -164,32 +182,47 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         observations,
         rng=None,
     ):
-        
+        # ==================== MODIFIED SECTION START ====================
+        # Handle dictionary observations to get batch size correctly.
+        # We get all arrays in the dict ('leaves'), take the first one, and get its batch dim.
+        first_leaf = jax.tree_util.tree_leaves(observations)[0]
+        batch_size = first_leaf.shape[0]
+        # ===================== MODIFIED SECTION END =====================
         if self.config["actor_type"] == "distill-ddpg":
+            action_dim = self.config['action_dim'] * \
+                         (self.config['horizon_length'] if self.config["action_chunking"] else 1)
+
+            # --- MODIFIED: Use the new `batch_size` variable ---
             noises = jax.random.normal(
                 rng,
-                (
-                    *observations.shape[: -len(self.config['ob_dims'])],  # batch_size
-                    self.config['action_dim'] * \
-                        (self.config['horizon_length'] if self.config["action_chunking"] else 1),
-                ),
+                (batch_size, action_dim),
             )
             actions = self.network.select(f'actor_onestep_flow')(observations, noises)
             actions = jnp.clip(actions, -1, 1)
 
         elif self.config["actor_type"] == "best-of-n":
             action_dim = self.config['action_dim'] * \
-                        (self.config['horizon_length'] if self.config["action_chunking"] else 1)
+                         (self.config['horizon_length'] if self.config["action_chunking"] else 1)
+            
+            # --- MODIFIED: Use the new `batch_size` variable ---
             noises = jax.random.normal(
                 rng,
                 (
-                    *observations.shape[: -len(self.config['ob_dims'])],  # batch_size
-                    self.config["actor_num_samples"], action_dim
+                    batch_size,
+                    self.config["actor_num_samples"],
+                    action_dim
                 ),
             )
-            observations = jnp.repeat(observations[..., None, :], self.config["actor_num_samples"], axis=-2)
+            
+            # This part is correct: handle the dictionary repeat
+            observations = jax.tree_util.tree_map(
+                lambda arr: jnp.repeat(arr[:, None, ...], self.config["actor_num_samples"], axis=1),
+                observations
+            )
+            
             actions = self.compute_flow_actions(observations, noises)
             actions = jnp.clip(actions, -1, 1)
+
             if self.config["q_agg"] == "mean":
                 q = self.network.select("critic")(observations, actions).mean(axis=0)
             else:
@@ -242,7 +275,17 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         rng, init_rng = jax.random.split(rng, 2)
 
         ex_times = ex_actions[..., :1]
-        ob_dims = ex_observations.shape
+
+        # --- MODIFIED SECTION START ---
+        # Handle both single-tensor and dictionary (multi-modal) observations
+        if isinstance(ex_observations, dict):
+            # For multi-modal input, store a dictionary of shapes instead of a single shape
+            ob_dims = {k: v.shape for k, v in ex_observations.items()}
+        else:
+            # For single-tensor input, keep the original behavior
+            ob_dims = ex_observations.shape
+        # --- MODIFIED SECTION END ---
+
         action_dim = ex_actions.shape[-1]
         if config["action_chunking"]:
             full_actions = jnp.concatenate([ex_actions] * config["horizon_length"], axis=-1)
@@ -253,11 +296,25 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
-            encoder_module = encoder_modules[config['encoder']]
-            encoders['critic'] = encoder_module()
-            encoders['actor_bc_flow'] = encoder_module()
-            encoders['actor_onestep_flow'] = encoder_module()
+            all_obs_keys = ex_observations.keys()
+            image_keys = sorted([k for k in all_obs_keys if k.startswith('image')])
+            state_key = 'state' # state 키는 'state'로 가정
 
+             # 설정에 맞는 인코더 클래스를 가져옵니다.
+            encoder_module = encoder_modules[config['encoder']]
+            
+            # 인코더를 생성할 때, 미리 파악한 키 정보를 전달합니다.
+            encoders['critic'] = encoder_module(
+                image_keys=image_keys, state_key=state_key
+            )
+            encoders['actor_bc_flow'] = encoder_module(
+                image_keys=image_keys, state_key=state_key
+            )
+            encoders['actor_onestep_flow'] = encoder_module(
+                image_keys=image_keys, state_key=state_key
+            )
+            # --- 수정된 부분 끝 ---
+            
         # Define networks.
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],
@@ -317,10 +374,10 @@ def get_config():
     config = ml_collections.ConfigDict(
         dict(
             agent_name='acfql',  # Agent name.
-            ob_dims=ml_collections.config_dict.placeholder(list),  # Observation dimensions (will be set automatically).
+            ob_dims=ml_collections.config_dict.placeholder(dict),  # Observation dimensions (will be set automatically).
             action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (will be set automatically).
             lr=3e-4,  # Learning rate.
-            batch_size=256,  # Batch size.
+            batch_size=64,  # Batch size.
             actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512, 512),  # Value network hidden dimensions.
             layer_norm=True,  # Whether to use layer normalization.
@@ -332,7 +389,7 @@ def get_config():
             num_qs=2, # critic ensemble size
             flow_steps=10,  # Number of flow steps.
             normalize_q_loss=False,  # Whether to normalize the Q loss.
-            encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
+            encoder='robotics_multi_image_small',  # Visual encoder name (None, 'impala_small', etc.).
             horizon_length=ml_collections.config_dict.placeholder(int), # will be set
             action_chunking=True,  # False means n-step return
             actor_type="distill-ddpg",

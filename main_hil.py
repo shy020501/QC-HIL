@@ -133,7 +133,7 @@ def main(_):
     np.random.seed(FLAGS.seed)
 
     online_rng, rng = jax.random.split(jax.random.PRNGKey(FLAGS.seed), 2)
-    log_step = 0
+    log_step = 1
     
     discount = FLAGS.discount
     config["horizon_length"] = FLAGS.horizon_length
@@ -211,9 +211,11 @@ def main(_):
         
     rl_buffer_lock = threading.Lock()
     demo_buffer_lock = threading.Lock()
-    log_lock = threading.Lock()
 
+    log_lock = threading.Lock()
+    rpc_lock = threading.Lock()
     intervene_lock = threading.Lock()
+    
     prev_step_intervened = False  # 직전 스텝에 유저 개입 있었는지
     
     # 파라미터 공유
@@ -265,7 +267,7 @@ def main(_):
 
     action_queue = []
     local_version = -1
-    rpc_call_count = 0
+    rpc_call_count = 1
 
     def _process_obs_keys(ob_dict):
         return {PROCESS_KEYS[k]: v for k, v in ob_dict.items() if k in PROCESS_KEYS}
@@ -278,11 +280,7 @@ def main(_):
         return {"ok": True}
     
     def act(payload):
-        nonlocal online_rng, agent, action_queue, local_version, rpc_call_count, log_step, prev_step_intervened
-        rpc_call_count += 1
-
-        with log_lock:
-            log_step += 1
+        nonlocal online_rng, agent, action_queue, local_version, prev_step_intervened
 
         ob = payload["ob"]
         processed_ob = _process_obs_keys(ob)
@@ -302,8 +300,6 @@ def main(_):
 
         if len(action_queue) == 0:
             if must_skip_chunk:
-                rpc_call_count -= 1
-                log_step -= 1
                 action = np.zeros((action_dim,), dtype=np.float32)
                 if FLAGS.save_interval > 0 and (rpc_call_count % FLAGS.save_interval == 0):
                     save_agent(agent, FLAGS.save_dir, log_step)
@@ -323,7 +319,7 @@ def main(_):
 
     # Transition을 replay buffer에 추가
     def push_transition(payload):
-        nonlocal logger, prev_step_intervened
+        nonlocal logger, prev_step_intervened, log_step, rpc_call_count
         ob         = payload["ob"]
         next_ob    = payload["next_ob"]
         reward     = float(payload["reward"])
@@ -336,6 +332,12 @@ def main(_):
         done = terminated or truncated
         processed_ob = _process_obs_keys(ob)
         processed_next_ob = _process_obs_keys(next_ob)
+
+        with rpc_lock:
+            rpc_call_count += 1
+
+        with log_lock:
+            log_step += 1
 
         if "intervene_action" in info: 
             used_action = np.asarray(info.pop("intervene_action"), dtype=np.float32)

@@ -58,7 +58,9 @@ def main():
             except Exception:
                 pass
 
-            client.call("push_transition", payload)
+            # 받은게 dummy면서, 이번 step에 intervention이 없었으면 해당 transaction에 intervention이 없었으면, transition에 넣으면 안됨
+            if not resp['dummy'] or 'intervene_action' in step_info:
+                client.call("push_transition", payload)
             ob = next_ob
 
         ep += 1

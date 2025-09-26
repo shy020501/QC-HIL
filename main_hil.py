@@ -171,6 +171,7 @@ def main(_):
     
     train_dataset = process_train_dataset(train_dataset)
     example_batch = train_dataset.sample(())
+    action_dim = example_batch['actions'].shape[-1]
     
     agent_class = agents[config['agent_name']]
     agent = agent_class.create(
@@ -211,6 +212,9 @@ def main(_):
     rl_buffer_lock = threading.Lock()
     demo_buffer_lock = threading.Lock()
     log_lock = threading.Lock()
+
+    intervene_lock = threading.Lock()
+    prev_step_intervened = False  # 직전 스텝에 유저 개입 있었는지
     
     # 파라미터 공유
     params_ref = {'params': agent.network.params}
@@ -267,45 +271,59 @@ def main(_):
         return {PROCESS_KEYS[k]: v for k, v in ob_dict.items() if k in PROCESS_KEYS}
 
     def on_reset(payload):
-        nonlocal action_queue
+        nonlocal action_queue, prev_step_intervened
         action_queue = []
+        with intervene_lock:
+            prev_step_intervened = False
         return {"ok": True}
     
     def act(payload):
-        nonlocal online_rng, agent, action_queue, local_version, rpc_call_count, log_step
+        nonlocal online_rng, agent, action_queue, local_version, rpc_call_count, log_step, prev_step_intervened
         rpc_call_count += 1
 
         with log_lock:
             log_step += 1
 
         ob = payload["ob"]
-        
-        # [TODO] agent jax numpy로 보내야 할지 확인 필요
-        # from jax import tree_util; import jax.numpy as jnp
-        # ob = tree_util.tree_map(lambda x: jnp.asarray(x), ob)
+        processed_ob = _process_obs_keys(ob)
 
-        # [TODO] 버전 바뀔 때 마다 update 할지 혹은 pull_interval 마다 할지 고민해보면 좋을듯
+        # 파라미터 pull 로직 유지
         if (rpc_call_count % FLAGS.param_pull_interval == 0) and (local_version != version_id['val']):
             with params_lock:
                 agent = agent.replace(network=agent.network.replace(params=params_ref['params']))
                 local_version = version_id['val']
             action_queue = []
 
+        must_skip_chunk = False
+        with intervene_lock:
+            if prev_step_intervened:
+                must_skip_chunk = True
+                prev_step_intervened = False
+
         if len(action_queue) == 0:
+            if must_skip_chunk:
+                rpc_call_count -= 1
+                log_step -= 1
+                action = np.zeros((action_dim,), dtype=np.float32)
+                if FLAGS.save_interval > 0 and (rpc_call_count % FLAGS.save_interval == 0):
+                    save_agent(agent, FLAGS.save_dir, log_step)
+                return {"action": action, "dummy": True}
+
             online_rng, key = jax.random.split(online_rng)
-            a_chunk = agent.sample_actions(observations=ob, rng=key)
-            a_chunk = np.array(a_chunk).reshape(-1, a_chunk.shape[-1])
+            a_chunk = agent.sample_actions(observations=processed_ob, rng=key)
+            a_chunk = np.array(a_chunk).reshape(-1, action_dim)
             action_queue.extend([a for a in a_chunk])
+
+        action = np.asarray(action_queue.pop(0), dtype=np.float32)
 
         if FLAGS.save_interval > 0 and (rpc_call_count % FLAGS.save_interval == 0):
             save_agent(agent, FLAGS.save_dir, log_step)
 
-        action = action_queue.pop(0)
-        return {"action": np.asarray(action, dtype=np.float32)}
+        return {"action": action, "dummy": False}
 
     # Transition을 replay buffer에 추가
     def push_transition(payload):
-        nonlocal logger
+        nonlocal logger, prev_step_intervened
         ob         = payload["ob"]
         next_ob    = payload["next_ob"]
         reward     = float(payload["reward"])
@@ -328,6 +346,10 @@ def main(_):
             
         if intervened and FLAGS.override_aborts_chunk: 
             action_queue.clear()
+
+        with intervene_lock:
+            nonlocal prev_step_intervened
+            prev_step_intervened = intervened
 
         transition = dict(
             observations=processed_ob,

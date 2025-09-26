@@ -9,6 +9,7 @@ from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
 
 from utils.flax_utils import save_agent
 from utils.datasets import Dataset, ReplayBuffer
+from utils.async_saver import AsyncSaver
 import agentlace.inference as ali
 
 from evaluation import evaluate
@@ -133,7 +134,7 @@ def main(_):
     np.random.seed(FLAGS.seed)
 
     online_rng, rng = jax.random.split(jax.random.PRNGKey(FLAGS.seed), 2)
-    log_step = 1
+    log_step = 0
     
     discount = FLAGS.discount
     config["horizon_length"] = FLAGS.horizon_length
@@ -215,7 +216,8 @@ def main(_):
     log_lock = threading.Lock()
     rpc_lock = threading.Lock()
     intervene_lock = threading.Lock()
-    
+    action_queue_lock = threading.Lock()
+
     prev_step_intervened = False  # 직전 스텝에 유저 개입 있었는지
     
     # 파라미터 공유
@@ -262,12 +264,15 @@ def main(_):
     learner_thread = threading.Thread(target=learner_loop, name="learner", daemon=True)
     learner_thread.start()
 
+    # 비동기 저장용
+    async_saver = AsyncSaver(FLAGS.save_dir, params_lock)
+
     # Actor server 부분
     server = ali.InferenceServer(port_num=FLAGS.trainer_rpc_port)
 
     action_queue = []
     local_version = -1
-    rpc_call_count = 1
+    rpc_call_count = 0
 
     def _process_obs_keys(ob_dict):
         return {PROCESS_KEYS[k]: v for k, v in ob_dict.items() if k in PROCESS_KEYS}
@@ -280,17 +285,10 @@ def main(_):
         return {"ok": True}
     
     def act(payload):
-        nonlocal online_rng, agent, action_queue, local_version, prev_step_intervened
+        nonlocal online_rng, agent, action_queue, prev_step_intervened
 
         ob = payload["ob"]
         processed_ob = _process_obs_keys(ob)
-
-        # 파라미터 pull 로직 유지
-        if (rpc_call_count % FLAGS.param_pull_interval == 0) and (local_version != version_id['val']):
-            with params_lock:
-                agent = agent.replace(network=agent.network.replace(params=params_ref['params']))
-                local_version = version_id['val']
-            action_queue = []
 
         must_skip_chunk = False
         with intervene_lock:
@@ -301,8 +299,6 @@ def main(_):
         if len(action_queue) == 0:
             if must_skip_chunk:
                 action = np.zeros((action_dim,), dtype=np.float32)
-                if FLAGS.save_interval > 0 and (rpc_call_count % FLAGS.save_interval == 0):
-                    save_agent(agent, FLAGS.save_dir, log_step)
                 return {"action": action, "dummy": True}
 
             online_rng, key = jax.random.split(online_rng)
@@ -312,14 +308,11 @@ def main(_):
 
         action = np.asarray(action_queue.pop(0), dtype=np.float32)
 
-        if FLAGS.save_interval > 0 and (rpc_call_count % FLAGS.save_interval == 0):
-            save_agent(agent, FLAGS.save_dir, log_step)
-
         return {"action": action, "dummy": False}
 
     # Transition을 replay buffer에 추가
     def push_transition(payload):
-        nonlocal logger, prev_step_intervened, log_step, rpc_call_count
+        nonlocal logger, prev_step_intervened, log_step, rpc_call_count, local_version
         ob         = payload["ob"]
         next_ob    = payload["next_ob"]
         reward     = float(payload["reward"])
@@ -339,6 +332,17 @@ def main(_):
         with log_lock:
             log_step += 1
 
+        # 파라미터 저장
+        if FLAGS.save_interval > 0 and (rpc_call_count % FLAGS.save_interval == 0):
+            async_saver.request(agent, log_step, params_ref=params_ref)   
+
+        # 파라미터 pull
+        if FLAGS.param_pull_interval > 0 and (rpc_call_count % FLAGS.param_pull_interval == 0) and (local_version != version_id['val']):
+            with params_lock:
+                agent = agent.replace(network=agent.network.replace(params=params_ref['params']))
+                local_version = version_id['val']
+            action_queue = []
+
         if "intervene_action" in info: 
             used_action = np.asarray(info.pop("intervene_action"), dtype=np.float32)
             intervened = True 
@@ -350,7 +354,6 @@ def main(_):
             action_queue.clear()
 
         with intervene_lock:
-            nonlocal prev_step_intervened
             prev_step_intervened = intervened
 
         transition = dict(
@@ -365,7 +368,6 @@ def main(_):
         with rl_buffer_lock:
             rl_buffer.add_transition(transition)
 
-        # 기존 env 로깅 규칙 유지
         env_info = {k: v for k, v in info.items() if str(k).startswith("distance")}
         if env_info:
             logger.log(env_info, "env", step=log_step)
@@ -380,7 +382,6 @@ def main(_):
 
         return {"ok": True}
 
-    # [ADD] RPC 엔드포인트 등록
     server.register_interface("on_reset", on_reset)
     server.register_interface("act", act)
     server.register_interface("push_transition", push_transition)
@@ -414,6 +415,8 @@ def main(_):
 
     with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
         f.write(run.url)
+
+    async_saver.flush_and_stop(agent, log_step, params_ref=params_ref, timeout=3.0)
 
 if __name__ == '__main__':
     app.run(main)

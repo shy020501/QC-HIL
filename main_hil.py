@@ -279,7 +279,8 @@ def main(_):
 
     def on_reset(payload):
         nonlocal action_queue, prev_step_intervened
-        action_queue = []
+        with action_queue_lock:
+            action_queue.clear()
         with intervene_lock:
             prev_step_intervened = False
         return {"ok": True}
@@ -290,23 +291,33 @@ def main(_):
         ob = payload["ob"]
         processed_ob = _process_obs_keys(ob)
 
-        must_skip_chunk = False
         with intervene_lock:
+            must_skip_chunk = prev_step_intervened
             if prev_step_intervened:
-                must_skip_chunk = True
                 prev_step_intervened = False
 
-        if len(action_queue) == 0:
-            if must_skip_chunk:
-                action = np.zeros((action_dim,), dtype=np.float32)
-                return {"action": action, "dummy": True}
+        with action_queue_lock:
+            need_refill = (len(action_queue) == 0)
 
+        # 비어있고 intervene 직후면 dummy 동작 반환
+        if need_refill and must_skip_chunk:
+            action = np.zeros((action_dim,), dtype=np.float32)
+            return {"action": action, "dummy": True}
+
+        refill_chunk = None
+        if need_refill:
             online_rng, key = jax.random.split(online_rng)
             a_chunk = agent.sample_actions(observations=processed_ob, rng=key)
-            a_chunk = np.array(a_chunk).reshape(-1, action_dim)
-            action_queue.extend([a for a in a_chunk])
+            refill_chunk = np.array(a_chunk).reshape(-1, action_dim).tolist()
 
-        action = np.asarray(action_queue.pop(0), dtype=np.float32)
+        # 다시 락을 잡고, queue가 비어있으면 refill한 뒤 pop
+        with action_queue_lock:
+            if len(action_queue) == 0 and refill_chunk is not None:
+                action_queue.extend(refill_chunk)
+            if len(action_queue) == 0:
+                action = np.zeros((action_dim,), dtype=np.float32)
+                return {"action": action, "dummy": True}
+            action = np.asarray(action_queue.pop(0), dtype=np.float32)
 
         return {"action": action, "dummy": False}
 
@@ -341,7 +352,8 @@ def main(_):
             with params_lock:
                 agent = agent.replace(network=agent.network.replace(params=params_ref['params']))
                 local_version = version_id['val']
-            action_queue = []
+            with action_queue_lock:
+                action_queue.clear()
 
         if "intervene_action" in info: 
             used_action = np.asarray(info.pop("intervene_action"), dtype=np.float32)
@@ -350,8 +362,9 @@ def main(_):
             used_action = action.astype(np.float32, copy=False)
             intervened = False 
             
-        if intervened and FLAGS.override_aborts_chunk: 
-            action_queue.clear()
+        if intervened and FLAGS.override_aborts_chunk:    
+            with action_queue_lock:
+                action_queue.clear()
 
         with intervene_lock:
             prev_step_intervened = intervened

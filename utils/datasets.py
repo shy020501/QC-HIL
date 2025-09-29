@@ -187,7 +187,6 @@ class Dataset(FrozenDict):
                 batch[key],
             )
 
-
 class ReplayBuffer(Dataset):
     """Replay buffer class.
 
@@ -246,6 +245,22 @@ class ReplayBuffer(Dataset):
         self.pointer = (self.pointer + 1) % self.max_size
         self.size = max(self.pointer, self.size)
 
+    def state_dict(self):
+        return {
+            "buffer": jax.tree_util.tree_map(lambda x: np.array(x, copy=True), self._dict),
+            "size": int(self.size),
+            "pointer": int(self.pointer),
+            "max_size": int(self.max_size),
+        }
+
+    @classmethod
+    def from_state_dict(cls, state):
+        obj = cls(state["buffer"])
+        obj.size = int(state["size"])
+        obj.pointer = int(state["pointer"])
+        obj.max_size = int(state.get("max_size", get_size(state["buffer"])))
+        return obj
+    
     def clear(self):
         """Clear the replay buffer."""
         self.size = self.pointer = 0

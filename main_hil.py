@@ -1,4 +1,4 @@
-import glob, tqdm, wandb, os, json, random, time, jax, threading, pickle, flax
+import glob, tqdm, wandb, os, json, random, time, jax, threading, pickle, re
 from absl import app, flags
 from ml_collections import config_flags
 from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
@@ -7,7 +7,7 @@ from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
 # from envs.ogbench_utils import make_ogbench_env_and_datasets
 # from envs.robomimic_utils import is_robomimic_env
 
-from utils.flax_utils import save_agent
+from utils.flax_utils import restore_full_checkpoint, restore_agent_with_file
 from utils.datasets import Dataset, ReplayBuffer
 from utils.async_saver import AsyncSaver
 import agentlace.inference as ali
@@ -61,6 +61,8 @@ flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 
 flags.DEFINE_string('custom_dataset_path', None, 'Path to a custom HDF5 dataset file.')
 flags.DEFINE_string('ckpt_path', None, 'Path to pretrained checkpoint.')
+flags.DEFINE_string('restore_ckpt', None,)
+
 
 flags.DEFINE_integer('horizon_length', 10, 'action chunking length.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
@@ -85,6 +87,27 @@ class LoggingHelper:
         assert prefix in self.csv_loggers, prefix
         self.csv_loggers[prefix].log(data, step=step)
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
+
+def extract_step(p):
+    m = re.search(r'(?:checkpoint|params)_(\d+)\.pkl$', os.path.basename(p))
+    return int(m.group(1)) if m else -1
+
+def resolve_ckpt_path(path):
+    """파일이면 그대로, 디렉토리면 최신 step의 checkpoint를 선택.
+       우선순위: checkpoint_*.pkl(풀) > params_*.pkl(에이전트 전용)
+    """
+    if path is None:
+        return None
+    if os.path.isdir(path):
+        c_full = glob.glob(os.path.join(path, 'checkpoint_*.pkl'))
+        c_agent = glob.glob(os.path.join(path, 'params_*.pkl'))
+        cands = sorted(c_full, key=extract_step) if c_full else sorted(c_agent, key=extract_step)
+        if not cands:
+            raise FileNotFoundError(f'No checkpoint under {path}')
+        return cands[-1]
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    return path
 
 def main(_):
     exp_name = get_exp_name(FLAGS.seed)
@@ -133,8 +156,12 @@ def main(_):
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
 
-    online_rng, rng = jax.random.split(jax.random.PRNGKey(FLAGS.seed), 2)
+    # online_rng, rng = jax.random.split(jax.random.PRNGKey(FLAGS.seed), 2)
+    online_rng = jax.random.PRNGKey(FLAGS.seed)
     log_step = 0
+    rpc_call_count = 0
+    action_queue = []
+    local_version = -1
     
     discount = FLAGS.discount
     config["horizon_length"] = FLAGS.horizon_length
@@ -182,17 +209,6 @@ def main(_):
         config,
     )
 
-    if FLAGS.ckpt_path is not None:
-        ckpt_path = FLAGS.ckpt_path
-        if os.path.exists(ckpt_path):
-            print(f"[INFO] Loading checkpoint from {ckpt_path}")
-            with open(ckpt_path, "rb") as f:
-                saved_dict = pickle.load(f)
-            agent = flax.serialization.from_state_dict(agent, saved_dict["agent"])
-        else:
-            print(f"[WARNING] Checkpoint path {ckpt_path} does not exist. Skipping load.")
-
-    # Setup logging.
     prefixes = ["eval", "env"]
     if FLAGS.offline_steps > 0:
         prefixes.append("offline_agent")
@@ -225,6 +241,38 @@ def main(_):
     version_id = {'val': 0}
     params_lock = threading.Lock()
     stop_event = threading.Event()
+
+    if FLAGS.ckpt_path:
+        try:
+            ckpt_path = resolve_ckpt_path(FLAGS.ckpt_path)
+
+            with open(ckpt_path, 'rb') as _f:
+                obj = pickle.load(_f)
+
+            if isinstance(obj, dict) and ( # 학습 ckpt 불러오기
+                'rl_buffer' in obj or 'meta' in obj or 'rng' in obj
+            ):
+                agent, meta = restore_full_checkpoint(agent, rl_buffer, demo_buffer, ckpt_path)
+
+                log_step = int(meta.get('log_step', log_step))
+                rpc_call_count = int(meta.get('rpc_call_count', 0))
+                online_rng = meta.get("online_rng", online_rng)
+                if meta.get('version_id') is not None:
+                    version_id['val'] = int(meta['version_id'])
+
+                ckpt_kind = "full"
+            else: # agent param만 불러오기
+                agent = restore_agent_with_file(agent, ckpt_path)
+                ckpt_kind = "agent"
+
+            with params_lock:
+                params_ref['params'] = agent.network.params
+
+            print(f"[RESTORE] {ckpt_kind} checkpoint loaded: {ckpt_path}")
+            print(f"[RESTORE] log_step={log_step}, rpc_call_count={locals().get('rpc_call_count', 'n/a')}, version_id={version_id['val']}")
+
+        except Exception as e:
+            print(f"[RESTORE][WARN] 복구 실패: {e}. 새 학습으로 진행합니다.")
 
     from collections import defaultdict
     data = defaultdict(list)
@@ -265,14 +313,14 @@ def main(_):
     learner_thread.start()
 
     # 비동기 저장용
-    async_saver = AsyncSaver(FLAGS.save_dir, params_lock)
+    async_saver = AsyncSaver(
+        FLAGS.save_dir, params_lock,
+        rl_buffer_lock=rl_buffer_lock,
+        demo_buffer_lock=demo_buffer_lock
+    )
 
     # Actor server 부분
     server = ali.InferenceServer(port_num=FLAGS.trainer_rpc_port)
-
-    action_queue = []
-    local_version = -1
-    rpc_call_count = 0
 
     def _process_obs_keys(ob_dict):
         return {PROCESS_KEYS[k]: v for k, v in ob_dict.items() if k in PROCESS_KEYS}
@@ -345,7 +393,13 @@ def main(_):
 
         # 파라미터 저장
         if FLAGS.save_interval > 0 and (rpc_call_count % FLAGS.save_interval == 0):
-            async_saver.request(agent, log_step, params_ref=params_ref)   
+            flags_snapshot = dict(FLAGS.flag_values_dict())
+            async_saver.request(
+                agent=agent, step=log_step, params_ref=params_ref,
+                rl_buffer=rl_buffer, demo_buffer=demo_buffer,
+                log_step=log_step, rpc_call_count=rpc_call_count,
+                version_id=version_id, flags_snapshot=flags_snapshot, online_rng=online_rng
+            )
 
         # 파라미터 pull
         if FLAGS.param_pull_interval > 0 and (rpc_call_count % FLAGS.param_pull_interval == 0) and (local_version != version_id['val']):
@@ -429,7 +483,14 @@ def main(_):
     with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
         f.write(run.url)
 
-    async_saver.flush_and_stop(agent, log_step, params_ref=params_ref, timeout=3.0)
+    flags_snapshot = dict(FLAGS.flag_values_dict())
+    async_saver.flush_and_stop(
+        agent=agent, step=log_step, params_ref=params_ref,
+        rl_buffer=rl_buffer, demo_buffer=demo_buffer,
+        log_step=log_step, rpc_call_count=rpc_call_count,
+        version_id=version_id, flags_snapshot=flags_snapshot, online_rng=online_rng,
+        timeout=3.0
+    )
 
 if __name__ == '__main__':
     app.run(main)

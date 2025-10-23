@@ -3,10 +3,6 @@ from absl import app, flags
 from ml_collections import config_flags
 from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
 
-# from envs.env_utils import make_env_and_datasets
-# from envs.ogbench_utils import make_ogbench_env_and_datasets
-# from envs.robomimic_utils import is_robomimic_env
-
 from utils.flax_utils import restore_full_checkpoint, restore_agent_with_file
 from utils.datasets import Dataset, ReplayBuffer
 from utils.async_saver import AsyncSaver
@@ -19,10 +15,18 @@ import numpy as np
 import h5py
 
 PROCESS_KEYS = {
-    "left/head_cam": "image_head",
-    "left/wrist_cam": "image_wrist_left",
-    "right/wrist_cam": "image_wrist_right",
     "state": "state",
+    # For Single
+    "head_cam": "image_head",
+    # "front_cam": "image_front",
+    "front_cam": "image_wrist_left",
+    "wrist_cam": "image_wrist_right",
+    # For Dual
+    "right/head_cam": "image_head",
+    # "right/front_cam": "image_front",
+    "right/front_cam": "image_wrist_left",
+    "right/wrist_cam": "image_wrist_right",
+    "left/wrist_cam": "image_wrist_left",
 }
 
 if 'CUDA_VISIBLE_DEVICES' in os.environ:
@@ -60,9 +64,8 @@ flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 
 
 flags.DEFINE_string('custom_dataset_path', None, 'Path to a custom HDF5 dataset file.')
+flags.DEFINE_string('custom_dataset_dir', None, 'Path to a custom HDF5 dataset file.')
 flags.DEFINE_string('ckpt_path', None, 'Path to pretrained checkpoint.')
-flags.DEFINE_string('restore_ckpt', None,)
-
 
 flags.DEFINE_integer('horizon_length', 10, 'action chunking length.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
@@ -75,6 +78,11 @@ flags.DEFINE_integer('param_pull_interval', 500, 'Actor pulls latest params ever
 
 flags.DEFINE_integer('trainer_rpc_port', 45587, 'Remote env server port.')
 
+flags.DEFINE_integer(
+    'data_loader_workers',
+    0,
+    "Number of CPU workers for dataset loading. 0 or 1 → sequential load; ≥2 → multiprocessing."
+)
 
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
@@ -87,6 +95,31 @@ class LoggingHelper:
         assert prefix in self.csv_loggers, prefix
         self.csv_loggers[prefix].log(data, step=step)
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
+
+def init_worker(data_dict, keys_list):
+    """
+    각 워커 프로세스가 생성될 때 한 번만 호출되어,
+    전역 변수로 큰 데이터 객체를 설정합니다.
+    """
+    global final_data_global, all_dataset_keys_global
+    final_data_global = data_dict
+    all_dataset_keys_global = keys_list
+
+# 병렬 작업을 수행할 워커 함수
+def load_chunk(task):
+    """
+    하나의 HDF5 파일을 읽어, initializer를 통해 받은 전역 배열에 데이터를 채워 넣습니다.
+    """
+    path, start_idx, size = task
+    end_idx = start_idx + size
+    try:
+        with h5py.File(path, 'r') as f:
+            for key in all_dataset_keys_global:
+                final_data_global[key][start_idx:end_idx] = f[key][()]
+        return size  # 작업한 크기 반환
+    except Exception as e:
+        print(f"\n[경고] 파일 처리 중 오류 '{path}': {e}")
+        return 0 # 오류 발생 시 0 반환
 
 def extract_step(p):
     m = re.search(r'(?:checkpoint|params)_(\d+)\.pkl$', os.path.basename(p))
@@ -121,14 +154,121 @@ def main(_):
         json.dump(flag_dict, f)
 
     config = FLAGS.agent
+
+    if FLAGS.custom_dataset_dir is not None:
+        # 1. 모든 데이터셋의 키와 최종 크기를 미리 계산합니다.
+        print("Step 1/3: Calculating total dataset size...")
+        dataset_paths = sorted(glob.glob(os.path.join(FLAGS.custom_dataset_dir, '*.h*5')))
+        if not dataset_paths:
+            raise FileNotFoundError(f"No HDF5 files found in {FLAGS.custom_dataset_dir}")
+        
+        # 유효한 파일 목록과 전체 크기를 저장할 변수
+        valid_dataset_paths = []
+        total_size = 0
+        all_dataset_keys = []
+        
+        # 첫 번째 유효한 파일을 찾아 데이터 구조 파악
+        example_file = None
+        for path in dataset_paths:
+            try:
+                example_file = h5py.File(path, 'r')
+                def find_keys(name, obj):
+                    if isinstance(obj, h5py.Dataset):
+                        all_dataset_keys.append(name)
+                example_file.visititems(find_keys)
+                break # 성공하면 루프 탈출
+            except OSError:
+                print(f"\n[경고] 파일 '{path}'이(가) 손상되어 건너뜁니다.")
+        
+        if example_file is None:
+            raise ValueError("모든 데이터셋 파일이 손상되었거나 읽을 수 없습니다.")
+
+        shapes = {key: example_file[key].shape[1:] for key in all_dataset_keys}
+        dtypes = {key: example_file[key].dtype for key in all_dataset_keys}
+        example_file.close()
+
+        # 모든 파일 스캔하여 크기 합산
+        for path in tqdm.tqdm(dataset_paths, desc="Scanning file sizes"):
+            try:
+                with h5py.File(path, 'r') as f:
+                    total_size += f['actions'].shape[0]
+                valid_dataset_paths.append(path)
+            except OSError as e:
+                print(f"\n[경고] 파일 '{path}'을(를) 읽는 중 오류 발생: {e}. 건너뜁니다.")
+        
+        dataset_paths = valid_dataset_paths
+        if not dataset_paths:
+            raise FileNotFoundError("오류: 유효한 HDF5 데이터셋 파일을 하나도 찾을 수 없습니다.")
+
+        print(f"Total timesteps found: {total_size}")
+
+        # 2. 최종 데이터를 담을 비어있는 NumPy 배열을 미리 할당합니다.
+        print("Step 2/3: Pre-allocating memory for the final dataset...")
+        final_data = {
+            key: np.empty((total_size, *shapes[key]), dtype=dtypes[key])
+            for key in all_dataset_keys
+        }
+
+        workers = int(max(0, FLAGS.data_loader_workers))
+        mode_str = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
+        print(f"Step 3/3: Loading data in {mode_str}...")
+
+        tasks = []
+        current_idx = 0
+        for path in dataset_paths:
+            with h5py.File(path, 'r') as f:
+                size = f['actions'].shape[0]
+                tasks.append((path, current_idx, size))
+                current_idx += size
+
+        if workers <= 1:
+            # === 단일 프로세스 순차 로딩 ===
+            from tqdm import tqdm as _tqdm
+            with _tqdm(total=total_size, desc="Sequential Loading") as pbar:
+                for (path, start_idx, size) in tasks:
+                    end_idx = start_idx + size
+                    try:
+                        with h5py.File(path, 'r') as f:
+                            for key in all_dataset_keys:
+                                final_data[key][start_idx:end_idx] = f[key][()]
+                        pbar.update(size)
+                    except Exception as e:
+                        print(f"\n[경고] 파일 처리 중 오류 '{path}': {e}")
+        else:
+            # === 멀티프로세싱 로딩 ===
+            from multiprocessing import Pool
+            with tqdm.tqdm(total=total_size, desc="Parallel Loading") as pbar:
+                # 필요한 만큼만 프로세스 생성
+                with Pool(processes=workers, initializer=init_worker, initargs=(final_data, all_dataset_keys)) as pool:
+                    for loaded_size in pool.imap_unordered(load_chunk, tasks):
+                        pbar.update(loaded_size)
+
+        # 5. 최종 train_dataset 딕셔너리를 재구성합니다.
+        train_dataset = {
+            'observations': {
+                'image_head': final_data['observations/image_head'],
+                'image_wrist_left': final_data['observations/image_wrist_left'],
+                'image_wrist_right': final_data['observations/image_wrist_right'],
+                'state': final_data['observations/state'],
+            },
+            'actions': final_data['actions'],
+            'rewards': final_data['rewards'],
+            'terminals': final_data['terminals'],
+            'next_observations': {
+                'image_head': final_data['next_observations/image_head'],
+                'image_wrist_left': final_data['next_observations/image_wrist_left'],
+                'image_wrist_right': final_data['next_observations/image_wrist_right'],
+                'state': final_data['next_observations/state'],
+            },
+        }
+        print("Dataset successfully merged.")
+        # D4RL 데이터셋 형식에 맞게 'timeouts'와 'masks' 추가
+        train_dataset['timeouts'] = train_dataset['terminals']
+        train_dataset['masks'] = 1.0 - train_dataset['terminals']
     
-    # =================================================================================
-    # Data Loading Section (CHANGED)
-    # =================================================================================
-    if FLAGS.custom_dataset_path is not None:
+    elif FLAGS.custom_dataset_path is not None:
         print(f"Loading custom dataset from: {FLAGS.custom_dataset_path}")
         
-        # 1. HDF5 파일에서 데이터 로드
         with h5py.File(FLAGS.custom_dataset_path, 'r') as f:
             train_dataset = {
                 'observations': {
@@ -151,6 +291,36 @@ def main(_):
         # D4RL 데이터셋 형식에 맞게 'timeouts'와 'masks' 추가
         train_dataset['timeouts'] = train_dataset['terminals']
         train_dataset['masks'] = 1.0 - train_dataset['terminals']
+    else:
+        # raise ValueError("custom_dataset_path를 반드시 지정해야 합니다.")
+        train_dataset = {}
+        dummy_images = np.zeros((100, 256, 256, 3))
+        dummy_states = np.zeros((100, 19))
+        dummy_actions = np.zeros((100, 7))
+        dummy_rewards = np.zeros((100, 1))
+        dummy_terminals = np.zeros((100, 1))
+        dummy_timeouts = np.zeros((100, 1))
+        dummy_masks = np.zeros((100, 1))
+
+        train_dataset = {
+            'observations': {
+                "image_head": dummy_images,
+                "image_wrist_left": dummy_images,
+                "image_wrist_right": dummy_images,
+                "state": dummy_states
+            },
+            'actions': dummy_actions,
+            'rewards': dummy_rewards,
+            'terminals': dummy_terminals,
+            'next_observations': {
+                "image_head": dummy_images,
+                "image_wrist_left": dummy_images,
+                "image_wrist_right": dummy_images,
+                "state": dummy_states
+            },
+            'timeouts': dummy_timeouts,
+            'masks': dummy_masks
+        }
 
     # house keeping
     random.seed(FLAGS.seed)
@@ -200,7 +370,7 @@ def main(_):
     train_dataset = process_train_dataset(train_dataset)
     example_batch = train_dataset.sample(())
     action_dim = example_batch['actions'].shape[-1]
-    
+
     agent_class = agents[config['agent_name']]
     agent = agent_class.create(
         FLAGS.seed,
@@ -225,7 +395,7 @@ def main(_):
     demo_buffer = ReplayBuffer.create_from_initial_dataset(
         dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
     )
-        
+
     rl_buffer_lock = threading.Lock()
     demo_buffer_lock = threading.Lock()
 
@@ -290,22 +460,37 @@ def main(_):
                 continue
 
             B = config['batch_size'] * FLAGS.utd_ratio
-            B_demo = B // 2
+            # B_demo = B // 2
+            B_demo = int(B * demo_buffer.size / (demo_buffer.size + rl_buffer.size))
             B_rl   = B - B_demo
 
             with demo_buffer_lock:
                 demo_sample = demo_buffer.sample_sequence(B_demo, sequence_length=H, discount=gamma)
             with rl_buffer_lock:
+                # demo_sample = rl_buffer.sample_sequence(B_demo, sequence_length=H, discount=gamma)
                 rl_sample = rl_buffer.sample_sequence(B_rl, sequence_length=H, discount=gamma)
 
-            batch = {k: np.concatenate([demo_sample[k], rl_sample[k]], axis=0) for k in demo_sample}
+            # batch = {k: np.concatenate([demo_sample[k], rl_sample[k]], axis=0) for k in demo_sample}
+            assert jax.tree_util.tree_structure(demo_sample) == jax.tree_util.tree_structure(rl_sample), "demo_sample과 rl_sample의 구조가 다릅니다."
 
-            agent, update_info = agent.batch_update(batch)
+            batch = jax.tree_util.tree_map(
+                lambda a, b: np.concatenate([a, b], axis=0),
+                demo_sample, rl_sample
+            )
+            batch = jax.tree.map(
+                lambda x: x.reshape((FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]),
+                batch
+            )
+
+            new_agent, update_info = agent.batch_update(batch)
 
             # 최신 파라미터 업데이트
             with params_lock:
-                params_ref['params'] = agent.network.params
+                agent = new_agent
+                # params_ref['params'] = agent.network.params
                 version_id['val'] += 1
+                update_version = version_id['val']
+                # print(f"[LOG] Param updated: Version {update_version}")
 
             logger.log(update_info, "online_agent", step=log_step)
 
@@ -355,7 +540,8 @@ def main(_):
         refill_chunk = None
         if need_refill:
             online_rng, key = jax.random.split(online_rng)
-            a_chunk = agent.sample_actions(observations=processed_ob, rng=key)
+            with params_lock:
+                a_chunk = agent.sample_actions(observations=processed_ob, rng=key)
             refill_chunk = np.array(a_chunk).reshape(-1, action_dim).tolist()
 
         # 다시 락을 잡고, queue가 비어있으면 refill한 뒤 pop
@@ -371,7 +557,7 @@ def main(_):
 
     # Transition을 replay buffer에 추가
     def push_transition(payload):
-        nonlocal logger, prev_step_intervened, log_step, rpc_call_count, local_version
+        nonlocal logger, prev_step_intervened, log_step, rpc_call_count, local_version, agent
         ob         = payload["ob"]
         next_ob    = payload["next_ob"]
         reward     = float(payload["reward"])
@@ -391,6 +577,9 @@ def main(_):
         with log_lock:
             log_step += 1
 
+        if rpc_call_count % 1000 == 0:
+            print(f"[LOG] Current Step: {rpc_call_count}")
+
         # 파라미터 저장
         if FLAGS.save_interval > 0 and (rpc_call_count % FLAGS.save_interval == 0):
             flags_snapshot = dict(FLAGS.flag_values_dict())
@@ -402,12 +591,13 @@ def main(_):
             )
 
         # 파라미터 pull
-        if FLAGS.param_pull_interval > 0 and (rpc_call_count % FLAGS.param_pull_interval == 0) and (local_version != version_id['val']):
-            with params_lock:
-                agent = agent.replace(network=agent.network.replace(params=params_ref['params']))
-                local_version = version_id['val']
-            with action_queue_lock:
-                action_queue.clear()
+        # if FLAGS.param_pull_interval > 0 and (rpc_call_count % FLAGS.param_pull_interval == 0) and (local_version != version_id['val']):
+        #     with params_lock:
+        #         agent = agent.replace(network=agent.network.replace(params=params_ref['params']))
+        #         local_version = version_id['val']
+        #         print(f"[LOG] Param pulled: Version {local_version}")
+        #     with action_queue_lock:
+        #         action_queue.clear()
 
         if "intervene_action" in info: 
             used_action = np.asarray(info.pop("intervene_action"), dtype=np.float32)

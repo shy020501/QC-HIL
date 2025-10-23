@@ -2,7 +2,8 @@ import argparse
 import numpy as np
 import agentlace.inference as ali
 from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
-from experiments.mappings import CONFIG_MAPPING
+from experiments.config import load_and_apply_config
+
 
 def npify_obs(obs):
     if isinstance(obs, dict):
@@ -14,18 +15,20 @@ def main():
     p.add_argument("--trainer_ip", type=str, default="115.145.172.97")
     p.add_argument("--trainer_port", type=int, default=45587) 
     p.add_argument("--env_name", type=str, default="cleanup_table")
+    p.add_argument("--arm_type", type=str, default="right")
     p.add_argument("--fake_env", action="store_true", default=False)
     p.add_argument("--save_video", action="store_true", default=False)
     p.add_argument("--classifier", action="store_true", default=False)
     p.add_argument("--episodes", type=int, default=0, help="0=loop forever")
     args = p.parse_args()
 
-    exp_config = CONFIG_MAPPING[args.env_name]()
-    env = exp_config.get_environment(
-        fake_env=args.fake_env,
-        save_video=args.save_video,
-        classifier=args.classifier,
+    train_config_instance = load_and_apply_config(
+        env_name=args.env_name,
+        arm_type=args.arm_type,
+        overrides=None,
     )
+    
+    env = train_config_instance.get_environment(fake_env=args.fake_env)
     env = RecordEpisodeStatistics(env)
 
     client = ali.InferenceClient(server_ip=args.trainer_ip, port_num=args.trainer_port)

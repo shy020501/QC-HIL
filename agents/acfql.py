@@ -37,11 +37,12 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         # We now use tree_map to apply the slicing to each array within the dict.
         
         # Helper lambda function to get the last element in a sequence
-        get_last_in_seq = lambda arr: arr[:, -1]
+        # get_last_in_seq = lambda arr: arr[:, -1]
+        get_last_in_seq = lambda arr: jax.numpy.take(arr, indices=-1, axis=1)
         
         # Apply this function to the entire next_observations dictionary
         last_next_obs = jax.tree_util.tree_map(get_last_in_seq, batch['next_observations'])
-        
+
         # TD loss
         rng, sample_rng = jax.random.split(rng)
         # Use the processed last_next_obs dictionary
@@ -175,6 +176,16 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         # update_size = batch["observations"].shape[0]
         agent, infos = jax.lax.scan(self._update, self, batch)
         return agent, jax.tree_util.tree_map(lambda x: x.mean(), infos)
+    
+    # @jax.jit
+    # def batch_update(self, batch):
+    #     def body_fn(agent, _):
+    #         agent, info = self._update(agent, batch)
+    #         return agent, info
+    #     agent, info = jax.lax.fori_loop(0, self.config.get('utd_steps', 1), 
+    #                                     lambda i, carry: body_fn(carry, None), 
+    #                                     self)
+    #     return agent, info
     
     @jax.jit
     def sample_actions(
@@ -363,7 +374,7 @@ def get_config():
             ob_dims=ml_collections.config_dict.placeholder(dict),  # Observation dimensions (will be set automatically).
             action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (will be set automatically).
             lr=3e-4,  # Learning rate.
-            batch_size=64,  # Batch size.
+            batch_size=128,  # Batch size.
             actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512, 512),  # Value network hidden dimensions.
             layer_norm=True,  # Whether to use layer normalization.
